@@ -16,7 +16,12 @@ import seaborn as sns
 from scipy.optimize import minimize
 import math, random
 from math import radians,cos,sin,asin,sqrt
-import gdal
+import sys
+import contextlib
+try:
+    from osgeo import gdal
+except ImportError:
+    gdal = None
 
 
 
@@ -593,19 +598,15 @@ def clip_and_normalize_slope(
 
 # This function reads a raster and converts it to a numpy array
 def raster_to_numpy_array(rasterFile):
-    # open raster dataset
-    dem = gdal.Open(rasterFile)
-
-    print ('Driver: ', dem.GetDriver().ShortName,'/', dem.GetDriver().LongName,)
-    print ('Size is ',dem.RasterXSize,'x',dem.RasterYSize,'x',dem.RasterCount)
-    print ('Projection is ',dem.GetProjection())
-    geotransform = dem.GetGeoTransform()
-    if not geotransform is None:
-        print ('Origin = (',geotransform[0], ',',geotransform[3],')')
-        print ('Pixel Size = (',geotransform[1], ',',geotransform[5],')')
-    myArray = np.array(dem.GetRasterBand(1).ReadAsArray())
-
-    return myArray, geotransform
+    """
+    Read raster as array and return array plus geotransform-like tuple.
+    Uses rasterio instead of GDAL for easier HPC installation.
+    """
+    with rasterio.open(rasterFile) as src:
+        arr = src.read(1)
+        tf = src.transform
+        geotransform = (tf.c, tf.a, tf.b, tf.f, tf.d, tf.e)
+    return arr, geotransform
 
 def extract_from_clipped_raster(df, clipped_raster_path, geotransform):
     """
@@ -965,7 +966,7 @@ def process_slice_round(
     # concat and filter to this MC round
     df_mc = pd.concat([df1, df2], ignore_index=True)
     df_mc = df_mc[df_mc["MC_round"] == mc_round]
-    df_mc['time'] = pd.to_datetime(df_mc['time'], errors='coerce').dt.floor('S')
+    df_mc['time'] = pd.to_datetime(df_mc['time'], errors='coerce').dt.floor('s')
 
     # Auto‐derive which attrs to hand into ORTEGA
     # run ORTEGA
@@ -1064,7 +1065,7 @@ def process_slice(
     #    return slice_idx, 0, 0    
 
     df_slice['time'] = pd.to_datetime(df_slice['time'], errors='coerce')\
-                       .dt.floor('S')
+                       .dt.floor('s')
 
 
     # 1b) OBSERVED‐SLICE INTERACTIONS
@@ -1148,10 +1149,24 @@ def process_slice(
         t0 = pd.to_datetime(df_obs.loc[df_obs.index[0], "time"])
 
         _, df_mc_all = create_crw_monte_carlo_simulation(
-            M_C, len(df_obs), persis, mu, sigma, sigma_1,
-            myArray, myArray.shape[1], myArray.shape[0],
-            envArr, mask, np.zeros_like(myArray,int),
-            time_step_hours, t0, id_sel, slf, taf
+            mc_stop,
+            len(df_obs),
+            persis,
+            mu,
+            sigma,
+            sigma_1,
+            myArray,
+            myArray.shape[1],
+            myArray.shape[0],
+            envArr,
+            mask,
+            np.zeros_like(myArray, int),
+            time_step_hours,
+            t0,
+            id_sel,
+            slf,
+            taf,
+            mc_start=mc_start
         )
 
         # Extract environmental values and projected coordinates
@@ -1202,7 +1217,8 @@ def process_slice_time(
     M_C: int = 10,
     time_bins: List[float] = None,
     time_labels: List[str] = None,
-    candidate_attrs: Optional[List[str]] = None
+    candidate_attrs: Optional[List[str]] = None,
+    window_hours: int = 1000
 ) -> Tuple[int,int,int]:
     """
     1) Cut out slice #slice_idx (1 000 hours window)
@@ -1228,7 +1244,7 @@ def process_slice_time(
     # 1) SLICE BY A 1 000‑HOUR TIME WINDOW RATHER THAN POINT COUNT
     overall_start = df_full['time'].min()
     overall_end   = df_full['time'].max()
-    window        = pd.Timedelta(hours=1000)
+    window        = pd.Timedelta(hours=window_hours)
 
     # build list of (start, end) windows
     windows = []
@@ -1262,7 +1278,7 @@ def process_slice_time(
         return slice_idx, 0, 0
 
     df_slice = pd.concat([s1, s2], ignore_index=True)
-    df_slice['time'] = pd.to_datetime(df_slice['time'], errors='coerce').dt.floor('S')
+    df_slice['time'] = pd.to_datetime(df_slice['time'], errors='coerce').dt.floor('s')
     print(f"[Slice {slice_idx:03d}] window {win_start}→{win_end}, n1={len(s1)}, n2={len(s2)}")
     # ───────────────────────────────────────────────────────────────────────────
 
@@ -1387,17 +1403,18 @@ def process_slice_time(
 def process_slice_reverse_time(
     slice_idx: int,
     window_start: pd.Timestamp,
-    window_end:   pd.Timestamp,
+    window_end: pd.Timestamp,
     df_full: pd.DataFrame,
-    id_pair: Tuple[int,int],
+    id_pair: Tuple[int, int],
     raster_paths: dict,
     slice_output_base: Path,
     M_C: int = 10,
     time_bins: List[float] = None,
     time_labels: List[str] = None,
     mc_start: int = 1,
-    mc_stop: Optional[int] = None
-) -> Tuple[int,int,int]:
+    mc_stop: Optional[int] = None,
+    window_hours: int = 1000
+) -> Tuple[int, int, int]:
     """
     1) Cut out slice #slice_idx (1 000 hours window)
     2) Re‐fit all distributions on that slice
@@ -1413,37 +1430,22 @@ def process_slice_reverse_time(
         mc_stop = M_C
 
     # prepare output folders
-    clip_dir = slice_output_base / slice_label / "clipped_rasters"
-    sim_dir  = slice_output_base / slice_label / "simulations"
-    int_dir  = slice_output_base / slice_label / "interactions"
+    batch_label = f"MC{mc_start:04d}_{mc_stop:04d}"
+
+    slice_dir = slice_output_base / slice_label
+    clip_dir = slice_dir / "clipped_rasters"
+    sim_dir = slice_dir / batch_label / "simulations"
+    int_dir = slice_dir / batch_label / "interactions"
+    
     for d in (clip_dir, sim_dir, int_dir):
         d.mkdir(parents=True, exist_ok=True)
 
     # ───────────────────────────────────────────────────────────────────────────
-    # 1) REVERSE 1 000‑HOUR WINDOWS ANCHORED ON THE END, THEN REVERSE TO CHRONOLOGICAL
-    overall_start = df_full['time'].min()
-    overall_end   = df_full['time'].max()
-    window        = pd.Timedelta(hours=1000)
-
-    # build windows anchored at the end
-    rev_windows = []
-    cur_end = overall_end
-    while True:
-        cur_start = cur_end - window
-        if cur_start < overall_start:
-            # if the last head‐chunk is shorter than 1000 h, drop it
-            break
-        rev_windows.append((cur_start, cur_end))
-        cur_end = cur_start
-
-    # rev_windows = [(last-1000h, last), (last-2000h, last-1000h), …]
-    # reverse to chronological so slice000 is the earliest window
-    windows = list(reversed(rev_windows))
-
-    # pick the slice‐th window
-    if slice_idx >= len(windows):
-        return slice_idx, 0, 0
-    win_start, win_end = windows[slice_idx]
+    # 1) Use the reverse-time window already built in the notebook
+    #    The notebook constructs windows anchored at the end of the shared timeline,
+    #    reverses them to chronological order, and passes the selected window here.
+    win_start = pd.to_datetime(window_start)
+    win_end   = pd.to_datetime(window_end)
 
     # split by that time span
     df1 = df_full[df_full.idcollar == id1]
@@ -1454,7 +1456,7 @@ def process_slice_reverse_time(
         return slice_idx, 0, 0
 
     df_slice = pd.concat([s1, s2], ignore_index=True)
-    df_slice['time'] = pd.to_datetime(df_slice['time'], errors='coerce').dt.floor('S')
+    df_slice['time'] = pd.to_datetime(df_slice['time'], errors='coerce').dt.floor('s')
     print(f"[Slice {slice_idx:03d}] window {win_start} → {win_end}, n1={len(s1)}, n2={len(s2)}")
     # ───────────────────────────────────────────────────────────────────────────
 
@@ -1556,3 +1558,606 @@ def process_slice_reverse_time(
             total_pairs  += np_
 
     return slice_idx, total_events, total_pairs
+
+
+
+def process_slice_reverse_time_quiet(args, log_dir):
+    """
+    Quiet wrapper for process_slice_reverse_time.
+
+    Redirects stdout/stderr from each worker process to a slice-specific log file,
+    so Jupyter output stays clean. It also writes .done/.failed marker files
+    to make run-status checking more reliable than relying only on parquet files.
+    """
+    import contextlib
+    import traceback
+    import time
+    from pathlib import Path
+
+    slice_idx = args[0]
+    window_hours = args[-1] if len(args) >= 13 else "NA"
+
+    log_dir = Path(log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    log_file = log_dir / f"WIN{window_hours}_slice{slice_idx:04d}.log"
+    done_file = log_dir / f"WIN{window_hours}_slice{slice_idx:04d}.done"
+    failed_file = log_dir / f"WIN{window_hours}_slice{slice_idx:04d}.failed"
+
+    # Remove stale markers from previous attempts
+    for marker in (done_file, failed_file):
+        if marker.exists():
+            marker.unlink()
+
+    start_time = time.time()
+
+    try:
+        with open(log_file, "w") as f:
+            f.write(f"START slice={slice_idx}, window_hours={window_hours}\n")
+            f.write(f"args_length={len(args)}\n")
+            f.write("=" * 80 + "\n\n")
+            f.flush()
+
+            with contextlib.redirect_stdout(f), contextlib.redirect_stderr(f):
+                result = process_slice_reverse_time(*args)
+
+            elapsed = time.time() - start_time
+            f.write("\n\n" + "=" * 80 + "\n")
+            f.write(f"FINISHED slice={slice_idx}, window_hours={window_hours}\n")
+            f.write(f"result={result}\n")
+            f.write(f"elapsed_seconds={elapsed:.2f}\n")
+
+        done_file.write_text(
+            f"done\n"
+            f"slice={slice_idx}\n"
+            f"window_hours={window_hours}\n"
+            f"result={result}\n"
+            f"elapsed_seconds={elapsed:.2f}\n"
+            f"log_file={log_file}\n"
+        )
+
+        return {
+            "slice_idx": slice_idx,
+            "status": "done",
+            "result": result,
+            "log_file": str(log_file),
+            "done_file": str(done_file),
+            "failed_file": None,
+            "error": None,
+        }
+
+    except Exception as e:
+        elapsed = time.time() - start_time
+        err_text = traceback.format_exc()
+
+        with open(log_file, "a") as f:
+            f.write("\n\n" + "=" * 80 + "\n")
+            f.write("===== WORKER FAILED =====\n")
+            f.write(f"slice={slice_idx}, window_hours={window_hours}\n")
+            f.write(f"elapsed_seconds={elapsed:.2f}\n")
+            f.write(err_text)
+            f.write("\n")
+
+        failed_file.write_text(
+            f"failed\n"
+            f"slice={slice_idx}\n"
+            f"window_hours={window_hours}\n"
+            f"elapsed_seconds={elapsed:.2f}\n"
+            f"error={repr(e)}\n"
+            f"log_file={log_file}\n\n"
+            f"{err_text}\n"
+        )
+
+        return {
+            "slice_idx": slice_idx,
+            "status": "failed",
+            "result": None,
+            "log_file": str(log_file),
+            "done_file": None,
+            "failed_file": str(failed_file),
+            "error": repr(e),
+        }
+
+# =============================================================================
+# Interaction-only parallel rerun utilities
+# Use when CRW simulation parquet files already exist.
+# Parallelizes MC interaction analysis within one slice.
+# =============================================================================
+
+def _safe_label(label):
+    return str(label).replace("/", "_").replace(" ", "_")
+
+
+def _is_nonzero_file(path):
+    path = Path(path)
+    return path.exists() and path.stat().st_size > 0
+
+
+def _remove_zero_or_partial_outputs(ev_path, pr_path):
+    """
+    If either output exists but is 0-byte, remove both event/pair files
+    so the bin can be recomputed cleanly.
+    """
+    bad = False
+
+    for p in (ev_path, pr_path):
+        if p.exists() and p.stat().st_size == 0:
+            bad = True
+
+    if bad:
+        for p in (ev_path, pr_path):
+            if p.exists():
+                p.unlink()
+
+
+def _bin_done_marker(int_dir, id_pair, slice_label, mc_round, time_bin_label):
+    id1, id2 = id_pair
+    done_dir = int_dir / "_bin_done"
+    done_dir.mkdir(parents=True, exist_ok=True)
+    return done_dir / f"{id1}_{id2}_{slice_label}_MC{mc_round:04d}_{_safe_label(time_bin_label)}.done"
+
+
+def _mc_done_marker(int_dir, id_pair, slice_label, mc_round):
+    id1, id2 = id_pair
+    done_dir = int_dir / "_mc_done"
+    done_dir.mkdir(parents=True, exist_ok=True)
+    return done_dir / f"{id1}_{id2}_{slice_label}_MC{mc_round:04d}.done"
+
+
+def _write_done_marker(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+
+
+def _bin_already_done(int_dir, id_pair, slice_label, mc_round, time_bin_label):
+    """
+    A bin is done if:
+    1) a done marker exists, OR
+    2) both event and pair parquet outputs exist and are non-zero.
+
+    For zero-event results, there may be no parquet output, so the marker is important.
+    """
+    id1, id2 = id_pair
+
+    marker = _bin_done_marker(int_dir, id_pair, slice_label, mc_round, time_bin_label)
+    if marker.exists():
+        return True
+
+    ev_path = int_dir / f"{id1}_{id2}_{slice_label}_events_{time_bin_label}_MC{mc_round:04d}.parquet"
+    pr_path = int_dir / f"{id1}_{id2}_{slice_label}_pairs_{time_bin_label}_MC{mc_round:04d}.parquet"
+
+    _remove_zero_or_partial_outputs(ev_path, pr_path)
+
+    if _is_nonzero_file(ev_path) and _is_nonzero_file(pr_path):
+        _write_done_marker(
+            marker,
+            f"done\nsource=existing_parquet\nslice={slice_label}\nMC={mc_round}\ntime_bin={time_bin_label}\n"
+        )
+        return True
+
+    return False
+
+
+def _log_has_completed_mc(log_text, mc_round, time_labels):
+    """
+    Check older logs for evidence that all bins for a given MC were processed.
+    This is useful for runs before .done markers were added.
+    """
+    if not log_text:
+        return False
+
+    mc_tag = f"MC {mc_round:04d}"
+
+    for lbl in time_labels:
+        # Match common log patterns:
+        # "... MC 0578, bin=1h-1d ..."
+        # "... MC 0578 bin=1h-1d already computed"
+        if (f"{mc_tag}, bin={lbl}" not in log_text) and (f"{mc_tag} bin={lbl}" not in log_text):
+            return False
+
+    return True
+
+
+def find_missing_mcs_for_slice(
+    slice_output_base,
+    slice_idx,
+    id_pair,
+    mc_start,
+    mc_stop,
+    time_labels,
+    window_hours=1000
+):
+    """
+    Return MC rounds that still need interaction analysis for this slice.
+
+    Uses:
+    - per-MC done marker
+    - per-bin done markers
+    - existing event/pair parquet outputs
+    - old log evidence
+    """
+    slice_output_base = Path(slice_output_base)
+
+    slice_label = f"slice{slice_idx:03d}"
+    batch_label = f"MC{mc_start:04d}_{mc_stop:04d}"
+
+    int_dir = slice_output_base / slice_label / batch_label / "interactions"
+    log_dir = slice_output_base / "_logs"
+    old_log = log_dir / f"WIN{window_hours}_slice{slice_idx:04d}.log"
+
+    log_text = ""
+    if old_log.exists():
+        try:
+            log_text = old_log.read_text(errors="ignore")
+        except Exception:
+            log_text = ""
+
+    missing = []
+    done = []
+
+    for mc in range(mc_start, mc_stop + 1):
+
+        mc_marker = _mc_done_marker(int_dir, id_pair, slice_label, mc)
+        if mc_marker.exists():
+            done.append(mc)
+            continue
+
+        # Old log says this MC had all bins processed
+        if _log_has_completed_mc(log_text, mc, time_labels):
+            _write_done_marker(
+                mc_marker,
+                f"done\nsource=old_log\nslice={slice_label}\nMC={mc}\n"
+            )
+            done.append(mc)
+            continue
+
+        # Check all bins through marker/parquet outputs
+        all_bins_done = all(
+            _bin_already_done(int_dir, id_pair, slice_label, mc, lbl)
+            for lbl in time_labels
+        )
+
+        if all_bins_done:
+            _write_done_marker(
+                mc_marker,
+                f"done\nsource=bin_markers_or_existing_parquet\nslice={slice_label}\nMC={mc}\n"
+            )
+            done.append(mc)
+        else:
+            missing.append(mc)
+
+    return done, missing
+
+
+def _read_sim_for_mc(sim_path, mc_round):
+    """
+    Read only needed columns for one MC round if possible.
+    Falls back to full-column read + filter if parquet filtering is unavailable.
+    """
+    needed_cols = ["idcollar", "proj_lat", "proj_lon", "time", "MC_round"]
+
+    try:
+        df = pd.read_parquet(
+            sim_path,
+            columns=needed_cols,
+            filters=[("MC_round", "==", mc_round)]
+        )
+    except Exception:
+        df = pd.read_parquet(sim_path, columns=needed_cols)
+        df = df[df["MC_round"] == mc_round]
+
+    return df
+
+
+def process_one_mc_all_bins_interaction_only(
+    slice_label,
+    mc_round,
+    sim_dir,
+    id_pair,
+    int_dir,
+    time_bins,
+    time_labels
+):
+    """
+    Process all time bins for one MC round.
+    Reads simulation parquets once per MC, instead of once per MC×bin.
+    """
+    id1, id2 = id_pair
+
+    # If the whole MC is already done, skip
+    mc_marker = _mc_done_marker(int_dir, id_pair, slice_label, mc_round)
+    if mc_marker.exists():
+        return mc_round, 0, 0, "already_done"
+
+    # Determine bins still needing work
+    bins_to_run = []
+    for lo, hi, lbl in zip(time_bins[:-1], time_bins[1:], time_labels):
+        if not _bin_already_done(int_dir, id_pair, slice_label, mc_round, lbl):
+            bins_to_run.append((lo, hi, lbl))
+
+    if not bins_to_run:
+        _write_done_marker(
+            mc_marker,
+            f"done\nsource=all_bins_already_done\nslice={slice_label}\nMC={mc_round}\n"
+        )
+        return mc_round, 0, 0, "already_done"
+
+    # Read simulation files once for this MC
+    f1 = sim_dir / f"crw_sim_{id1}_{id2}_{slice_label}_{id1}.parquet"
+    f2 = sim_dir / f"crw_sim_{id1}_{id2}_{slice_label}_{id2}.parquet"
+
+    if not f1.exists() or not f2.exists():
+        raise FileNotFoundError(
+            f"Missing simulation parquet(s): {f1 if not f1.exists() else ''} {f2 if not f2.exists() else ''}"
+        )
+
+    df1 = _read_sim_for_mc(f1, mc_round)
+    df2 = _read_sim_for_mc(f2, mc_round)
+
+    df_mc = pd.concat([df1, df2], ignore_index=True)
+    df_mc["time"] = pd.to_datetime(df_mc["time"], errors="coerce").dt.floor("s")
+
+    if df_mc.empty:
+        raise ValueError(f"No simulation rows found for MC {mc_round}")
+
+    total_events = 0
+    total_pairs = 0
+
+    for lo, hi, lbl in bins_to_run:
+
+        marker = _bin_done_marker(int_dir, id_pair, slice_label, mc_round, lbl)
+
+        ev_path = int_dir / f"{id1}_{id2}_{slice_label}_events_{lbl}_MC{mc_round:04d}.parquet"
+        pr_path = int_dir / f"{id1}_{id2}_{slice_label}_pairs_{lbl}_MC{mc_round:04d}.parquet"
+
+        _remove_zero_or_partial_outputs(ev_path, pr_path)
+
+        orobj = ortega.ORTEGA(
+            data=df_mc,
+            latitude_field="proj_lat",
+            longitude_field="proj_lon",
+            minute_min_delay=float(lo),
+            minute_max_delay=float(hi),
+            time_field="time",
+            id_field="idcollar",
+            max_el_time_min=120.0,
+            speed_average=True,
+            attr_fields=None
+        )
+
+        res = orobj.interaction_analysis()
+
+        if res is None or res.df_interaction_events.empty:
+            _write_done_marker(
+                marker,
+                f"done\nresult=zero_events\nslice={slice_label}\nMC={mc_round}\ntime_bin={lbl}\n"
+            )
+            print(f"[{id_pair}],[{slice_label}] ✅ MC {mc_round:04d}, bin={lbl} → 0 events")
+            continue
+
+        if lo == 0:
+            res.compute_interaction_duration()
+
+        df_ev = res.df_interaction_events.copy()
+        df_ev["MC_round"] = mc_round
+        df_ev["time_bin"] = lbl
+        df_ev.to_parquet(ev_path, index=False)
+
+        df_pairs = res.df_all_intersection_pairs.copy()
+        df_pairs["MC_round"] = mc_round
+        df_pairs["time_bin"] = lbl
+        df_pairs.to_parquet(pr_path, index=False)
+
+        _write_done_marker(
+            marker,
+            f"done\nresult=events\nslice={slice_label}\nMC={mc_round}\ntime_bin={lbl}\n"
+            f"n_events={len(df_ev)}\nn_pairs={len(df_pairs)}\n"
+        )
+
+        total_events += len(df_ev)
+        total_pairs += len(df_pairs)
+
+        print(
+            f"[{id_pair}],[{slice_label}] ✅ MC {mc_round:04d}, bin={lbl} → "
+            f"{len(df_ev)} events, {len(df_pairs)} pairs"
+        )
+
+    # Mark whole MC done after all bins are processed
+    _write_done_marker(
+        mc_marker,
+        f"done\nsource=processed_now\nslice={slice_label}\nMC={mc_round}\n"
+        f"n_events_added={total_events}\nn_pairs_added={total_pairs}\n"
+    )
+
+    return mc_round, total_events, total_pairs, "done"
+
+
+def process_interaction_mc_batch_for_slice_quiet(args, log_dir):
+    """
+    Quiet worker for interaction-only MC batches.
+
+    Args:
+        (
+            slice_idx,
+            id_pair,
+            slice_output_base,
+            mc_values,
+            time_bins,
+            time_labels,
+            mc_start,
+            mc_stop,
+            window_hours
+        )
+    """
+    import contextlib
+    import traceback
+    import time
+    from pathlib import Path
+
+    (
+        slice_idx,
+        id_pair,
+        slice_output_base,
+        mc_values,
+        time_bins,
+        time_labels,
+        mc_start,
+        mc_stop,
+        window_hours
+    ) = args
+
+    slice_output_base = Path(slice_output_base)
+    id1, id2 = id_pair
+    slice_label = f"slice{slice_idx:03d}"
+    batch_label = f"MC{mc_start:04d}_{mc_stop:04d}"
+
+    sim_dir = slice_output_base / slice_label / batch_label / "simulations"
+    int_dir = slice_output_base / slice_label / batch_label / "interactions"
+
+    log_dir = Path(log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    if len(mc_values) == 0:
+        return {
+            "slice_idx": slice_idx,
+            "status": "done",
+            "mc_start": None,
+            "mc_end": None,
+            "n_mcs": 0,
+            "events": 0,
+            "pairs": 0,
+            "log_file": None,
+            "error": None,
+        }
+
+    batch_start = min(mc_values)
+    batch_end = max(mc_values)
+
+    log_file = log_dir / (
+        f"WIN{window_hours}_{slice_label}_interaction_only_"
+        f"MC{batch_start:04d}_{batch_end:04d}.log"
+    )
+
+    done_file = log_dir / (
+        f"WIN{window_hours}_{slice_label}_interaction_only_"
+        f"MC{batch_start:04d}_{batch_end:04d}.done"
+    )
+
+    failed_file = log_dir / (
+        f"WIN{window_hours}_{slice_label}_interaction_only_"
+        f"MC{batch_start:04d}_{batch_end:04d}.failed"
+    )
+
+    for p in (done_file, failed_file):
+        if p.exists():
+            p.unlink()
+
+    start_time = time.time()
+    total_events = 0
+    total_pairs = 0
+    processed = 0
+
+    try:
+        with open(log_file, "w") as f:
+            f.write(
+                f"START interaction-only batch\n"
+                f"pair={id1}_{id2}\n"
+                f"slice={slice_label}\n"
+                f"MC range={batch_start}-{batch_end}\n"
+                f"n_mcs={len(mc_values)}\n"
+                f"sim_dir={sim_dir}\n"
+                f"int_dir={int_dir}\n"
+                + "=" * 80 + "\n\n"
+            )
+            f.flush()
+
+            with contextlib.redirect_stdout(f), contextlib.redirect_stderr(f):
+                for mc in mc_values:
+                    mc_round, ne, npairs, status = process_one_mc_all_bins_interaction_only(
+                        slice_label=slice_label,
+                        mc_round=int(mc),
+                        sim_dir=sim_dir,
+                        id_pair=id_pair,
+                        int_dir=int_dir,
+                        time_bins=time_bins,
+                        time_labels=time_labels
+                    )
+
+                    processed += 1
+                    total_events += ne
+                    total_pairs += npairs
+
+                    if processed % 10 == 0:
+                        print(
+                            f"[batch {batch_start}-{batch_end}] progress: "
+                            f"{processed}/{len(mc_values)} MCs processed"
+                        )
+
+            elapsed = time.time() - start_time
+            f.write("\n" + "=" * 80 + "\n")
+            f.write(
+                f"FINISHED interaction-only batch\n"
+                f"pair={id1}_{id2}\n"
+                f"slice={slice_label}\n"
+                f"MC range={batch_start}-{batch_end}\n"
+                f"processed={processed}\n"
+                f"events={total_events}\n"
+                f"pairs={total_pairs}\n"
+                f"elapsed_seconds={elapsed:.2f}\n"
+            )
+
+        done_file.write_text(
+            f"done\n"
+            f"pair={id1}_{id2}\n"
+            f"slice={slice_label}\n"
+            f"MC range={batch_start}-{batch_end}\n"
+            f"processed={processed}\n"
+            f"events={total_events}\n"
+            f"pairs={total_pairs}\n"
+            f"elapsed_seconds={elapsed:.2f}\n"
+            f"log_file={log_file}\n"
+        )
+
+        return {
+            "slice_idx": slice_idx,
+            "status": "done",
+            "mc_start": batch_start,
+            "mc_end": batch_end,
+            "n_mcs": len(mc_values),
+            "events": total_events,
+            "pairs": total_pairs,
+            "log_file": str(log_file),
+            "error": None,
+        }
+
+    except Exception as e:
+        elapsed = time.time() - start_time
+        err_text = traceback.format_exc()
+
+        with open(log_file, "a") as f:
+            f.write("\n" + "=" * 80 + "\n")
+            f.write("===== INTERACTION BATCH FAILED =====\n")
+            f.write(err_text)
+
+        failed_file.write_text(
+            f"failed\n"
+            f"pair={id1}_{id2}\n"
+            f"slice={slice_label}\n"
+            f"MC range={batch_start}-{batch_end}\n"
+            f"elapsed_seconds={elapsed:.2f}\n"
+            f"error={repr(e)}\n"
+            f"log_file={log_file}\n\n"
+            f"{err_text}\n"
+        )
+
+        return {
+            "slice_idx": slice_idx,
+            "status": "failed",
+            "mc_start": batch_start,
+            "mc_end": batch_end,
+            "n_mcs": len(mc_values),
+            "events": total_events,
+            "pairs": total_pairs,
+            "log_file": str(log_file),
+            "error": repr(e),
+        }
